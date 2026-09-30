@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   Alert,
@@ -63,11 +63,37 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
   const [correctionReason, setCorrectionReason] = useState('');
   const { data, isLoading } = useQuery({ queryKey: ['carbon-api'], queryFn: fetchEvidence });
   const store = useCarbonStore();
+  const hydrate = useCarbonStore((state) => state.hydrate);
+  const outbox = useCarbonStore((state) => state.outbox);
+  const lastConflict = useCarbonStore((state) => state.lastConflict);
+  const online = useCarbonStore((state) => state.online);
+  const pendingCount = outbox.filter((item) => item.status === 'pending').length;
+  const conflictCount = outbox.filter((item) => item.status === 'conflict').length;
   const selected = store.records.find((record) => record.id === store.selectedRecordId) ?? store.records[0];
   const visibleRecords = useMemo(() => recordFilter === '全部' ? store.records : store.records.filter((record) => record.status === recordFilter), [recordFilter, store.records]);
   const totalReduction = store.records.reduce((total, record) => total + record.activity * record.factor / (record.unit === 'kWh' ? 1000 : record.unit === 'L' ? 1000 : 1), 0);
   const openFindings = store.findings.filter((item) => item.status !== '已关闭');
   const allIssuanceChecked = Object.values(store.issuanceChecks).every(Boolean) && openFindings.length === 0;
+
+  // 服务端权威数据（修订链、发现项、签发确认）同步到本地。
+  useEffect(() => {
+    if (data) hydrate(data);
+  }, [data, hydrate]);
+
+  // 断网先留本地待提交，恢复联网后按原标识补交；不同数据互不阻塞。
+  useEffect(() => {
+    const goOnline = () => {
+      useCarbonStore.getState().setOnline(true);
+      void useCarbonStore.getState().flushOutbox();
+    };
+    const goOffline = () => useCarbonStore.getState().setOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []);
 
   const nav = [
     { id: 'overview', label: '监测期总览', href: '/', icon: DashboardOutlined },
@@ -114,6 +140,8 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
             <Typography fontSize={10} color="#a9c5bc">MRV Evidence & Issuance Readiness</Typography>
           </Box>
           <Box sx={{ flex: 1 }} />
+          {pendingCount > 0 && <Chip size="small" label={`${pendingCount} 条待提交`} sx={{ color: '#9fd8c4', borderColor: '#4a8c76', bgcolor: 'rgba(255,255,255,.05)' }} variant="outlined" />}
+          {conflictCount > 0 && <Chip size="small" label={`${conflictCount} 条冲突`} sx={{ color: '#ffb4a7', borderColor: '#a85a4a', bgcolor: 'rgba(255,255,255,.05)' }} variant="outlined" />}
           <Chip size="small" label={`${openFindings.length} 项发现开放`} sx={{ color: '#ffdda7', borderColor: '#a87935', bgcolor: 'rgba(255,255,255,.05)' }} variant="outlined" />
           <IconButton color="inherit"><NotificationsNoneOutlined /></IconButton>
           <Avatar sx={{ width: 30, height: 30, bgcolor: '#e1a45d', fontSize: 12 }}>沈</Avatar>
@@ -136,6 +164,38 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
             </Stack>
           </Stack>
           {isLoading && <LinearProgress />}
+
+          <Stack spacing={1} mb={2}>
+            {!online && (
+              <Alert severity="warning" variant="outlined">
+                当前断网：{pendingCount} 条修订已留本地待提交，恢复联网后将按原标识补交，不同数据互不阻塞。
+              </Alert>
+            )}
+            {online && pendingCount > 0 && (
+              <Alert severity="info" variant="outlined">
+                {pendingCount} 条修订正在补交中（按原提交标识重试）。
+              </Alert>
+            )}
+            {lastConflict && lastConflict.currentVersion >= 0 && (
+              <Alert
+                severity="error"
+                variant="outlined"
+                onClose={store.dismissConflict}
+                action={
+                  <Button color="inherit" size="small" onClick={() => store.retryConflict(lastConflict.recordId)}>
+                    按 V{lastConflict.currentVersion} 重新提交
+                  </Button>
+                }
+              >
+                记录 {lastConflict.recordId} 版本已过期：服务端当前为 V{lastConflict.currentVersion}，本地提交基于旧版本。请基于当前版本重新提交。
+              </Alert>
+            )}
+            {lastConflict && lastConflict.currentVersion < 0 && (
+              <Alert severity="error" variant="outlined" onClose={store.dismissConflict}>
+                记录 {lastConflict.recordId} 提交失败，已保留在待提交队列中，稍后将自动重试。
+              </Alert>
+            )}
+          </Stack>
 
           {view === 'overview' && (
             <>
@@ -227,7 +287,18 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
               </Card>
               <Stack spacing={1.5}>
                 <Card elevation={0} variant="outlined"><CardContent><Typography fontWeight={800} fontSize={14}>签发就绪度</Typography><Stack direction="row" alignItems="baseline" spacing={1} mt={1}><Typography variant="h4" fontWeight={850}>{Math.round(Object.values(store.issuanceChecks).filter(Boolean).length / 4 * 70 + (openFindings.length === 0 ? 30 : 0))}%</Typography><Typography fontSize={11} color="text.secondary">完成度</Typography></Stack><LinearProgress variant="determinate" value={Object.values(store.issuanceChecks).filter(Boolean).length / 4 * 100} sx={{ height: 7, borderRadius: 3, mt: 1 }} /><Typography fontSize={11} color="text.secondary" mt={1.2}>还有 {openFindings.length} 个开放发现项。</Typography></CardContent></Card>
-                <Card elevation={0} variant="outlined"><CardContent><Stack direction="row" justifyContent="space-between"><Typography fontWeight={800} fontSize={14}>版本与核验意见</Typography><IconButton size="small"><MoreHorizOutlined /></IconButton></Stack>{[['V4', '韩跃', '修订柴油活动数据并补充测试运行说明'], ['V3', '沈楠', '要求补充流量计校准证据'], ['V2', '徐璐', '统一电量单位并附原始记录']].map((item) => <Stack key={item[0]} direction="row" spacing={1.2} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}><Chip size="small" label={item[0]} /><Box><Typography fontSize={11.5} fontWeight={700}>{item[1]}</Typography><Typography fontSize={10.5} color="text.secondary">{item[2]}</Typography></Box></Stack>)}</CardContent></Card>
+                <Card elevation={0} variant="outlined"><CardContent><Stack direction="row" justifyContent="space-between" alignItems="center"><Typography fontWeight={800} fontSize={14}>版本与核验意见</Typography><Stack direction="row" spacing={.5} alignItems="center"><Chip size="small" label={selected.id} /><IconButton size="small"><MoreHorizOutlined /></IconButton></Stack></Stack>
+                  {[...selected.revisions].reverse().map((rev) => (
+                    <Stack key={rev.version} direction="row" spacing={1.2} sx={{ borderTop: '1px solid #edf0ef', py: 1.2 }}>
+                      <Chip size="small" label={`V${rev.version}`} color={rev.version === selected.revision ? 'primary' : 'default'} />
+                      <Box>
+                        <Typography fontSize={11.5} fontWeight={700}>{rev.actor}</Typography>
+                        <Typography fontSize={10.5} color="text.secondary">{rev.reason}</Typography>
+                        <Typography fontSize={10} color="text.secondary">{new Date(rev.recordedAt).toLocaleString('zh-CN')} · {rev.activity.toLocaleString()} {selected.unit}</Typography>
+                      </Box>
+                    </Stack>
+                  ))}
+                </CardContent></Card>
                 <Alert severity={allIssuanceChecked ? 'success' : 'warning'}>{allIssuanceChecked ? '全部门禁已完成，可提交签发准备。' : '关闭开放发现项并完成所有检查后可提交。'}</Alert>
               </Stack>
             </Box>
@@ -244,7 +315,7 @@ export default function EvidenceWorkbench({ initialView }: { initialView: View }
             <TextField fullWidth size="small" label={`修订值 / ${selected.unit}`} value={correctionValue} onChange={(event) => setCorrectionValue(event.target.value)} margin="normal" />
             <TextField fullWidth size="small" label="修订原因" multiline rows={3} value={correctionReason} onChange={(event) => setCorrectionReason(event.target.value)} margin="normal" />
             {!correctionReason.trim() && <Alert severity="warning">必须填写修订原因。</Alert>}
-            <Stack direction="row" spacing={1} justifyContent="flex-end" mt={2}><Button onClick={() => setCorrectionOpen(false)}>取消</Button><Button variant="contained" disabled={!correctionReason.trim() || !Number(correctionValue)} onClick={() => { store.reviseValue(selected.id, Number(correctionValue), correctionReason); setCorrectionOpen(false); setCorrectionReason(''); }}>生成新版本</Button></Stack>
+            <Stack direction="row" spacing={1} justifyContent="flex-end" mt={2}><Button onClick={() => setCorrectionOpen(false)}>取消</Button><Button variant="contained" disabled={!correctionReason.trim() || !Number(correctionValue)} onClick={() => { store.submitRevision(selected.id, Number(correctionValue), correctionReason); setCorrectionOpen(false); setCorrectionReason(''); }}>生成新版本</Button></Stack>
           </CardContent></Card>
         </Box>
       )}
