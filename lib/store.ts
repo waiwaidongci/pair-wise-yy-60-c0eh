@@ -1,46 +1,13 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { defaultFindings, defaultRecords } from './seed';
+import type { CarbonRecord, Finding, RecordStatus, RevisionEntry, RevisionState } from './seed';
+import type { ApiRecord, ApiRevision } from './schema';
 
-export type RecordStatus = '待核验' | '复核中' | '已核验' | '需补证';
-export type CarbonRecord = {
-  id: string;
-  source: string;
-  activity: number;
-  unit: string;
-  factor: number;
-  factorUnit: string;
-  timeRange: string;
-  evidenceCount: number;
-  anomaly: number;
-  owner: string;
-  status: RecordStatus;
-  revision: number;
-};
+export type { CarbonRecord, Finding, RecordStatus, RevisionEntry, RevisionState };
 
-export type Finding = {
-  id: string;
-  recordId: string;
-  type: '缺失证据' | '单位不一致' | '时间范围' | '异常波动';
-  title: string;
-  detail: string;
-  assignee: string;
-  due: string;
-  status: '开放' | '补证中' | '已关闭';
-};
-
-const defaultRecords: CarbonRecord[] = [
-  { id: 'ACT-0318', source: '电表 E-17 / 四号压缩机组', activity: 428650, unit: 'kWh', factor: 0.5568, factorUnit: 'tCO2/MWh', timeRange: '2026-07-01 至 07-31', evidenceCount: 4, anomaly: 2.3, owner: '项目现场 O2', status: '复核中', revision: 3 },
-  { id: 'ACT-0321', source: '蒸汽流量计 ST-04', activity: 2038.4, unit: 'GJ', factor: 0.1100, factorUnit: 'tCO2/GJ', timeRange: '2026-07-01 至 07-31', evidenceCount: 3, anomaly: 0, owner: '能源中心', status: '已核验', revision: 2 },
-  { id: 'ACT-0325', source: '柴油消耗台账 / 应急泵', activity: 1846, unit: 'L', factor: 2.6800, factorUnit: 'kgCO2/L', timeRange: '2026-07-01 至 07-31', evidenceCount: 2, anomaly: 8.6, owner: '设备保障部', status: '需补证', revision: 4 },
-  { id: 'ACT-0331', source: '光伏逆变器阵列 PV-2', activity: 182460, unit: 'kWh', factor: 0.5568, factorUnit: 'tCO2/MWh', timeRange: '2026-07-01 至 07-31', evidenceCount: 5, anomaly: -1.2, owner: '新能源运维', status: '已核验', revision: 1 },
-  { id: 'ACT-0337', source: '天然气流量计 NG-02', activity: 62.8, unit: 'kNm3', factor: 2.1622, factorUnit: 'tCO2/kNm3', timeRange: '2026-07-01 至 07-31', evidenceCount: 1, anomaly: 12.4, owner: '热力站', status: '待核验', revision: 1 }
-];
-
-const defaultFindings: Finding[] = [
-  { id: 'F-104', recordId: 'ACT-0337', type: '缺失证据', title: '缺少天然气流量计校验证书', detail: '计量记录已提交，但校准有效期证明不足。', assignee: '热力站 · 韩跃', due: '09-30', status: '开放' },
-  { id: 'F-105', recordId: 'ACT-0325', type: '异常波动', title: '柴油消耗较上期上升 18.6%', detail: '项目方尚未说明测试运行时长变化。', assignee: '设备保障部 · 姜婷', due: '10-02', status: '补证中' },
-  { id: 'F-106', recordId: 'ACT-0318', type: '单位不一致', title: '原始表单位为 MWh，台账记录为 kWh', detail: '需补充单位换算链并保留原始记录。', assignee: '项目现场 · 徐璐', due: '09-30', status: '开放' }
-];
+// 修订生效后需要失效重算的签发门禁项：均为数据相关确认；方法学匹配不受数据修订影响。
+const DATA_DEPENDENT_CHECKS = ['evidence', 'calculation', 'revisions'] as const;
 
 type State = {
   records: CarbonRecord[];
@@ -48,6 +15,8 @@ type State = {
   selectedRecordId: string;
   sampledIds: string[];
   issuanceChecks: Record<string, boolean>;
+  // 最近一次导致门禁失效的修订说明，用于在签发准备页提示确认为何被重置。
+  issuanceNotice: string | null;
   selectRecord: (id: string) => void;
   toggleSample: (id: string) => void;
   startCorrection: (id: string) => void;
@@ -56,8 +25,30 @@ type State = {
   requestEvidence: (findingId: string) => void;
   closeFinding: (findingId: string) => void;
   toggleIssuanceCheck: (id: string) => void;
-  reviseValue: (id: string, value: number, reason: string) => void;
+  // 以服务端数据为准同步记录（含完整修订链）。
+  syncFromServer: (records: ApiRecord[]) => void;
+  // 提交被接受后落地新版本（幂等重试时不会重复追加）。
+  applyCommittedRevision: (input: {
+    recordId: string;
+    version: number;
+    value: number;
+    reason: string;
+    actor: string;
+    recordedAt: string;
+    state: RevisionState;
+  }) => void;
 };
+
+function toClientRevision(entry: ApiRevision): RevisionEntry {
+  return {
+    version: entry.version,
+    value: entry.value,
+    reason: entry.reason,
+    actor: entry.actor,
+    recordedAt: entry.recordedAt,
+    state: entry.state
+  };
+}
 
 export const useCarbonStore = create<State>()(
   persist(
@@ -67,19 +58,86 @@ export const useCarbonStore = create<State>()(
       selectedRecordId: 'ACT-0318',
       sampledIds: ['ACT-0318', 'ACT-0337'],
       issuanceChecks: { evidence: false, calculation: true, revisions: true, methodology: false },
+      issuanceNotice: null,
       selectRecord: (id) => set({ selectedRecordId: id }),
       toggleSample: (id) => set((state) => ({ sampledIds: state.sampledIds.includes(id) ? state.sampledIds.filter((item) => item !== id) : [...state.sampledIds, id] })),
       startCorrection: (id) => set((state) => ({ records: state.records.map((record) => record.id === id ? { ...record, status: '复核中' } : record) })),
-      verifyRecord: (id) => set((state) => ({ records: state.records.map((record) => record.id === id ? { ...record, status: '已核验' } : record) })),
-      batchVerify: () => set((state) => ({ records: state.records.map((record) => state.sampledIds.includes(record.id) && record.status !== '需补证' ? { ...record, status: '已核验' } : record) })),
+      verifyRecord: (id) => set((state) => ({
+        records: state.records.map((record) => {
+          if (record.id !== id) return record;
+          // 修订链中处于复核中的结论随核验通过一并确认。
+          return {
+            ...record,
+            status: '已核验',
+            revisions: record.revisions.map((entry) => entry.state === '复核中' ? { ...entry, state: '已确认' } : entry)
+          };
+        })
+      })),
+      batchVerify: () => set((state) => ({
+        records: state.records.map((record) => state.sampledIds.includes(record.id) && record.status !== '需补证'
+          ? { ...record, status: '已核验', revisions: record.revisions.map((entry) => entry.state === '复核中' ? { ...entry, state: '已确认' } : entry) }
+          : record)
+      })),
       requestEvidence: (findingId) => set((state) => ({ findings: state.findings.map((finding) => finding.id === findingId ? { ...finding, status: '补证中' } : finding) })),
       closeFinding: (findingId) => set((state) => ({ findings: state.findings.map((finding) => finding.id === findingId ? { ...finding, status: '已关闭' } : finding) })),
       toggleIssuanceCheck: (id) => set((state) => ({ issuanceChecks: { ...state.issuanceChecks, [id]: !state.issuanceChecks[id] } })),
-      reviseValue: (id, value, reason) => set((state) => ({
-        records: state.records.map((record) => record.id === id ? { ...record, activity: value, revision: record.revision + 1, status: '复核中' } : record),
-        findings: reason ? state.findings : state.findings
-      }))
+      syncFromServer: (incoming) => set((state) => ({
+        records: incoming.map((record) => ({ ...record, revisions: record.revisions.map(toClientRevision) })),
+        selectedRecordId: incoming.some((record) => record.id === state.selectedRecordId) ? state.selectedRecordId : incoming[0]?.id ?? state.selectedRecordId
+      })),
+      applyCommittedRevision: (input) => set((state) => {
+        const target = state.records.find((record) => record.id === input.recordId);
+        if (!target) return state;
+        // 幂等重试：同一版本已落地则保持第一次的结果，不重复追加。
+        if (target.revisions.some((entry) => entry.version === input.version)) {
+          return state;
+        }
+
+        const entry: RevisionEntry = {
+          version: input.version,
+          value: input.value,
+          reason: input.reason,
+          actor: input.actor,
+          recordedAt: input.recordedAt,
+          state: input.state
+        };
+
+        return {
+          records: state.records.map((record) => record.id === input.recordId ? {
+            ...record,
+            activity: entry.value,
+            revision: entry.version,
+            // 修订生效：活动数据回到复核中，旧核验结论不再挂用。
+            status: '复核中',
+            revisions: [...record.revisions, entry]
+          } : record),
+          // 该数据的关联发现项重新打开（已关闭的回到开放，补证中/开放维持原状）。
+          findings: state.findings.map((finding) => finding.recordId === input.recordId && finding.status === '已关闭'
+            ? { ...finding, status: '开放' }
+            : finding),
+          // 签发准备中数据相关的人工确认全部失效，需要基于新版本重新确认；就绪度按新勾选重算。
+          issuanceChecks: Object.fromEntries(
+            Object.entries(state.issuanceChecks).map(([key, value]) => [key, DATA_DEPENDENT_CHECKS.includes(key as (typeof DATA_DEPENDENT_CHECKS)[number]) ? false : value])
+          ),
+          issuanceNotice: `${input.recordId} 的 V${input.version} 修订已生效，活动数据回到复核中，证据链、计算过程与修订追溯的确认已失效，请基于新版本重新复核。`
+        };
+      })
     }),
-    { name: 'yy60-carbon-evidence' }
+    {
+      name: 'yy60-carbon-evidence',
+      version: 1,
+      // 旧版本本地状态没有 append-only 修订链，直接丢弃其中的记录（加载后会由服务端数据同步）。
+      migrate: (persisted) => {
+        const previous = (persisted ?? {}) as Partial<State>;
+        return {
+          records: defaultRecords,
+          findings: previous.findings ?? defaultFindings,
+          selectedRecordId: previous.selectedRecordId ?? 'ACT-0318',
+          sampledIds: previous.sampledIds ?? ['ACT-0318', 'ACT-0337'],
+          issuanceChecks: previous.issuanceChecks ?? { evidence: false, calculation: true, revisions: true, methodology: false },
+          issuanceNotice: null
+        } as State;
+      }
+    }
   )
 );
